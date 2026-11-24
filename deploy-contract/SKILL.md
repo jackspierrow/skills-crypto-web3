@@ -1,0 +1,177 @@
+---
+name: deploy-contract
+description: "Deploys a facet/periphery contract to staging or testnet diamonds (CREATE3, explorer verify, diamondCut/diamondUpdatePeriphery, allowlist writes). Use for \"deploy <Contract> to <testnet>\". Mainnet, even a bare \"deploy X to <network>\" → multisig-rollout; tron/tronshasta → deploy-contract-tron."
+usage: /deploy-contract <ContractName> <network...> [--production]
+---
+
+# Deploy Contract
+
+Staging/testnet deploy path, and the deploy primitive `multisig-rollout` calls. A mainnet target — including a bare "deploy <Contract> to <network>" that names no environment — goes to `multisig-rollout`, which owns the Safe-proposal lifecycle mainnet registration requires. Requires Foundry, gh, and (production only) lifi-connect for MongoDB.
+
+Non-interactive deploy of a single contract (the version in the repo) to N networks via `script/deploy/deployContractToNetworks.sh` (scriptMaster use case 1, repeated). Per network it deploys (CREATE3), verifies on the explorer, and registers in the LiFiDiamond:
+
+- **facet** → `diamondCut` (a Safe proposal in production, direct cut in staging)
+- **periphery** → `diamondUpdatePeriphery`
+- **diamond-called periphery** → the above **plus** its allowlist writes (in production inside the registration proposal; in staging a separate sync)
+
+It stops once the contract is deployed, verified, and registered (production: proposal created carrying the deployer's signature). In the standalone staging path it also lands the resulting deployment-log changes via a draft PR (Phase 4). It never drives hardware-wallet signing or posts to Slack — and in production it leaves the PR to `multisig-rollout`.
+
+See also: `rotate-pauser-wallet` calls this skill to redeploy `EmergencyPauseFacet` with the new pauser when rotating the pauser wallet.
+
+**Hard rail — don't strand production proposals.** A standalone production deploy creates Safe proposals carrying a single signature and then stops; with no PR, no signing hand-off, and no Slack thread, those proposals sit forgotten below threshold. So: if this is a production deploy (`--production`) and you are **not** running it as a step inside `multisig-rollout`, stop and route the user to `/multisig-rollout`. Only proceed with `--production` here when `multisig-rollout` is driving the full lifecycle around you.
+
+**PR ownership.** The staging path opens its own deployment-log PR (Phase 4). The production PR is **not** this skill's job — when `multisig-rollout` drives, skip Phase 4; it opens the single combined PR (logs + nonce table) after capturing proposals.
+
+## Environment
+
+The target environment is a double opt-in enforced by the script: staging unless **both** `--production` is passed *and* `PRODUCTION=true` is in `.env`. Default standalone use is staging. Never edit `.env` to flip this — if `--production` and `.env` disagree, the script aborts; relay that to the user.
+
+## Phase 0 — Preflight
+
+**Tron gate — check first.** If the target network list includes `tron` or `tronshasta`, split them out: this skill's pipeline (`deployContractToNetworks.sh`, Foundry, CREATE3) has no Tron support at all. Hand those networks to `/deploy-contract-tron` (a different repo checkout — `contracts-tron` — and a different toolchain) and continue here only with the remaining EVM networks, if any.
+
+Run from the repo root. Check and report (don't fix silently):
+
+- `.env` exists; `PRODUCTION` matches the intended environment (`true` only for a production run); `SEND_PROPOSALS_DIRECTLY_TO_DIAMOND` not `true` for production (it bypasses the Safe — legitimate only when bootstrapping a new production network before ownership transfers to the Safe; abort otherwise); `MAX_CONCURRENT_JOBS` set.
+- Foundry available (`forge --version`); `gh auth status` OK.
+- Working tree state noted — the deploy writes `deployments/<net>.json` (and, for diamond-called periphery, `config/whitelist.json`), which the caller commits later.
+
+## Phase 1 — Resolve targets
+
+The target list comes from one of two sources:
+
+- **Explicit** — the user names the networks ("deploy MayanFacet to arbitrum, base, sei"). Use exactly those, in the order given. This is how a contract reaches a **new** network it isn't live on yet. The only requirement is that each named network already hosts a LiFiDiamond (this flow adds the contract to an existing diamond; it does **not** stand up a brand-new network — that's `/add-network` + a full deploy). If a named network has no diamond, flag it and drop it.
+- **Discovery** (when the user says "all chains where it's running" or names none) — networks where the contract is already live in the production diamond, plus its deployed version:
+
+```bash
+for F in deployments/*.diamond.json; do
+  NET=$(basename "$F" .diamond.json)
+  V=$(jq -r --arg N "<Contract>" '(.LiFiDiamond.Facets // {}) | to_entries[] | select(.value.Name == $N) | .value.Version' "$F" 2>/dev/null | head -1)
+  [ -n "$V" ] && echo "$NET $V"
+done
+```
+
+For periphery contracts check `.LiFiDiamond.Periphery | has($N)` instead. The glob matches only production logs (`*.diamond.staging.json` and `*.diamond.immutable.json` do not end in `.diamond.json`).
+
+Repo version: `grep -m1 "@custom:version" src/Facets/<Contract>.sol` (or `src/Periphery/...`). Report old → new version per network (a new network shows no current version — expected). Networks already on the repo version are re-deployed only if the user asked — surface them and ask.
+
+**Diamond-called periphery needs its allowlist writes.** A periphery contract the diamond invokes during swaps (e.g. `GasZipPeriphery`, `FeeCollector`, `LiFiDEXAggregator`) must be **both** registered in the diamond *and* added to the diamond's allowlist — registration alone (`PeripheryRegistry`) does not let the diamond call it. Detect deterministically:
+
+```bash
+jq -e --arg N "<Contract>" '.whitelistPeripheryFunctions | has($N)' config/global.json >/dev/null && echo "needs whitelist sync"
+```
+
+If it matches, in production each registration proposal also de-whitelists the replaced address's `global.json.whitelistPeripheryFunctions` selectors and whitelists the new address's, so there is still one proposal per network and no separate sync; the deploy then regenerates `config/whitelist.json` locally for the PR from every `deployments/*.json` on disk (an uncommitted edit to any of them lands in the file; a failed regeneration fails the run). In staging, Phase 3b syncs the allowlist afterwards. No manual `whitelist.json` editing either way. Facets and non-diamond-called periphery skip Phase 3b.
+
+In production, signing gate W refuses a registration whose selectors will not be allowlisted once the proposal runs, so a registration proposed without its whitelist writes cannot be signed.
+
+A contract listed under `global.json.whitelistPeripheryNetworks` is whitelisted only on the networks named there; one absent from that map is whitelisted on every network it is deployed to.
+
+**Facets with a required companion periphery.** A bridge facet usually covers only the source side; destination calls are completed by a partner contract on the same chain (`LiFiIntentEscrowFacetV2` → `ReceiverOIF`, `StargateFacetV2` → `ReceiverStargateV2`). Deploying the facet alone silently disables inbound transfers there. Detect deterministically:
+
+```bash
+jq -r --arg N "<Contract>" '.facetPeripheryCouplings[$N].requires // empty' config/global.json
+```
+
+If it names a companion, check every target network and **add the ones missing it to this deploy's target list**. An empty string or `MISSING` means it is not registered in that diamond:
+
+```bash
+jq -r --arg C "<Companion>" '.LiFiDiamond.Periphery[$C] // "MISSING"' deployments/<net>.diamond.json
+```
+
+`notRequiredOn` in the same coupling entry names networks where the companion is deliberately absent — respect it rather than deploying over it.
+
+Resolve this here rather than relying on `facetCompanionReminder.ts`: it is a non-fatal nudge that only checks the flat deploy log (silent once the companion is deployed, even if never registered), and the `facet-required-periphery` health-check invariant only catches the gap after the fact.
+
+## Phase 2 — Confirm plan
+
+Present: contract + version (old → new per network), the full network list, environment, and what will be created (per network: one registration, carrying the allowlist writes for a diamond-called periphery in production; in production each is a timelock-wrapped Safe proposal). Wait for explicit go-ahead — deployments cost gas and, in production, mint Safe proposals on many chains.
+
+## Phase 3 — Execute
+
+Run in the background (long-running; deploys retry and verify inline), monitor output, report per-network results:
+
+```bash
+# staging (default)
+./script/deploy/deployContractToNetworks.sh <Contract> <network...>
+
+# production (only inside multisig-rollout — see hard rail)
+./script/deploy/deployContractToNetworks.sh <Contract> <network...> --production
+```
+
+Ends with a per-network summary and exits `1` if any network failed. Failures don't block survivors: continue with the succeeded networks, report the failed ones, and offer to retry them individually with the same command. In production each proposal is created already carrying one signature (`signatureCount: 1`).
+
+## Phase 3b — Whitelist a diamond-called periphery (staging)
+
+Run only when Phase 1 flagged the contract as diamond-called, and only for staging and directly registered networks. After the deploy registered it, sync the allowlist on the same networks:
+
+```bash
+./script/tasks/syncWhitelistToNetworks.sh <network...>
+```
+
+This re-derives `whitelist.json` from `global.json.whitelistPeripheryFunctions` (picking up the just-deployed address) and applies a `batchSetContractSelectorWhitelist` cut. Skip it for production Safe networks: the registration proposal already carries the whitelist writes, and a separate sync proposal could execute first and de-whitelist the address the diamond still has registered. Skip entirely for facets and non-diamond-called periphery.
+
+## Phase 3c — Verify deployed contracts
+
+The deploy framework attempts explorer verification inline and, when it passes, already writes `verified:true` to MongoDB. Re-verify only what it left unverified, once per contract across all of the rollout's networks — `<env>` is `production` or `staging`, `<version>` is the repo version from Phase 1, and the networks are this rollout's targets:
+
+```bash
+bash script/deploy/verifyRolloutContracts.sh <env> <Contract> <version> <network...>
+```
+
+Run it from a checkout with submodules initialized (`git submodule update --init --recursive`) — an empty `lib/` makes every verify fail with a misleading `Unable to verify`.
+
+One MongoDB query loads every record of that contract version. On each listed network the record at the `deployments/<net>.json` address is verified on the explorer with the `solcVersion`/`evmVersion`/`optimizerRuns` it was deployed with (so london networks verify correctly whatever `FOUNDRY_PROFILE` the shell has), unless it is already flagged; the flag is flipped once it passes. Networks run concurrently up to `MAX_CONCURRENT_JOBS`. Tron networks and networks in `DO_NOT_VERIFY_IN_THESE_NETWORKS` are reported as skipped. It exits `0` only when every listed network is verified, already was, or was skipped, and exits `1` naming each failed network — including a network not in `networks.json`, a network with no record of `<version>` at its deployment-file address (a wrong version or contract argument is never read as "nothing to do"), or a failed query.
+
+## Phase 4 — Commit logs & draft PR (staging path only)
+
+Skip this phase when `multisig-rollout` is driving (production): it opens one
+combined PR after capturing proposals, since the body needs the Safe nonce table.
+
+1. Collect exactly what the deploy touched — **never `git add -A`**:
+
+   ```bash
+   git status --porcelain -- deployments/ 'config/whitelist*.json'
+   ```
+
+   The contract type need not be special-cased: a facet writes the diamond log's
+   Facets section + address map, periphery writes the Periphery section, a
+   diamond-called periphery also rewrites `config/whitelist.json` /
+   `config/whitelist.staging.json` (Phase 3b) — staging whatever changed covers
+   all of them. If the output is empty (idempotent re-deploy — same CREATE3
+   address, version already registered), there's nothing to land; skip.
+
+2. Delegate the branch / commit / template / push / create mechanic
+   to `/create-pr`, passing:
+   - **files to stage**: exactly the paths from step 1.
+   - **body** (the "Why"): contract, version (old → new per network), network
+     list, environment (staging), and the registration note for the type —
+     `diamondCut` (facet) / `diamondUpdatePeriphery` (periphery) / `+ allowlist
+     sync, whitelist.json updated` (diamond-called periphery).
+
+`/create-pr` stages only the named files and has its own confirm gate before it pushes.
+
+## Output
+
+Report a per-network result table the caller (or user) can act on:
+
+| Field | Source |
+|---|---|
+| `contract`, `version` | Phase 1 (repo `@custom:version`) |
+| `network`, `chainId` | target list / `config/networks.json` |
+| `address` | deploy summary / `deployments/<net>.json` |
+| `registration` | `diamondCut` (facet) or `diamondUpdatePeriphery` (periphery); `+ allowlist` for diamond-called periphery |
+| `proposalCreated` | production only — one per registration (sig 1), the allowlist writes included for diamond-called periphery |
+| `verified` | Phase 3c result |
+
+In production, note the files changed on disk (`deployments/<net>.json`, and `config/whitelist.json` / `config/whitelist.staging.json` for a diamond-called periphery) so the caller commits them, and that proposals carry a single signature awaiting the signing lifecycle. When run inside `multisig-rollout`, hand this table back so it can capture proposal nonces, draft the PR, and run the signing tail.
+
+## Failure modes
+
+- `--production` / `.env` mismatch → script aborts with a clear message; do not edit `.env`, relay it.
+- Deploy succeeded but production proposal missing → the propose step failed; check the network's deploy log and re-run that single network.
+- A network has no diamond → drop it from the list (this skill adds to existing diamonds only).
+- Explorer verification flaky → re-run `bash script/deploy/verifyRolloutContracts.sh <env> <Contract> <version> <network...>` (Phase 3c); it picks up only the records still unverified, and the MongoDB `verified` flag and on-chain verification must both hold.
+- `is not verified on Sourcify` warning (mainnet, non-zkEVM) → the deploy still succeeded, but the ERC-7730 clear-signing sync leaves that network out of the registry descriptor until every facet is on Sourcify. Run the `Retry with:` command from the warning; `https://sourcify.dev/server/v2/contract/<chainId>/<address>` returning 200 confirms it.
+- zkEVM-only target list (zksync/abstract) exits non-zero right after `building zksync artifacts`, with no error in a redirected log → `out/` is missing. The deploy salt comes from the standard artifact (`out/<C>.sol/<C>.json`), which the zk build never writes and `prepareGroupBuild zkevm` (a no-op) never triggers. Run `forge build --skip 'test/**'` first; only the salt/address depends on it, never the deployed bytecode. A mixed group list hides this because london/cancun builds `out/` first.
+- `Failed to deploy script` plus a "sufficient funds" warning on a funded deployer → re-run with `DEBUG=true` before chasing balances or RPCs. If the real stderr is ``header validation error: `prevrandao` not set``, the chain's RPC omits `mixHash` and no post-Merge `evm_version` can build the fork environment; set `targetEvmVersion: "london"` so the chain joins the london group (keeps build, deploy and verification consistent). `--legacy`, `--skip-simulation` and `block_prevrandao` do not help. Probe with `cast rpc eth_getBlockByNumber latest false --rpc-url "$R" | tr ',' '\n' | grep -i mixhash`.

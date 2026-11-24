@@ -1,0 +1,20 @@
+name: onchain_broadcast_retry_gate
+title: Verify a broadcast before you retry it
+description: Verify a signed transaction reached the chain before retrying a failed broadcast, so a swallowed send never becomes a false nonce error.
+category: Finance
+include_in_prompt: true
+skill_improvement:
+  managed: true
+  status: active
+  evidence_handles:
+  - ~/workspace/kgiwa/stress/results/sim_swap1000-20261118-1551.json
+  - chunk_handoff KGIWA swallowed-send mitigation
+  measurement:
+    proxy_metric_id: objective_success_rate
+    success_criterion: In the 30 days after install, at least one batched on-chain run follows verify before retry and no batch halts on a false nonce too low after a swallowed send, compared with the 1000 wallet run where two swallowed sends stopped the batch on blind retry.
+    window_days: 30
+  needs_review: false
+  rationale: 'On 18 Nov 2026 the GIWA RPC swallowed two send responses during the 1000 wallet KGIWA run (distribution wallet idx 1110 and sell wallet idx 1102) while both transactions had already landed on chain, and a blind retry produced a false nonce too low error and stopped the batch. The proven mitigation is to compute the transaction hash locally from the signed bytes and check get_transaction before any retry. Skill search found no skill covering this: wallet_identity_gate covers a signer mismatch pause and time_boxed_onchain_tasks covers polling and workspace state, and neither covers verifying a broadcast before retrying it. The 1000 wallet run finished 3000 of 3000 transactions with zero unresolved, and the 10000 wallet run ahead will send far more, so the method will be reused. Other window patterns were not proposed: the Dialectica scheduled login incident was already fixed in window by disabling the checker, the bounty fee and KYC corrections are already stated in the FEE 100x rule in AGENTS.md and in agentic-bug-hunter, the make.fun HOME per account recording rule is a time bound contest lesson already in MEMORY.md, and the 9 managed learned skills sit below the 10 skill consolidation threshold.'
+  review_after: 2026-12-18T17:22:45.021617+00:00
+  reviewed_at: 2026-11-18T17:22:45.021617+00:00
+  run_id: sirun_f2ba063d78bc4513b51883ba30fcedb6
